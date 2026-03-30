@@ -48,7 +48,7 @@ def pactl_device_sample_rate(kind, pactl_name):
         line = lines[i].strip()
         if line.startswith('Name:') and line.split(':', 1)[1].strip() == pactl_name:
             j = i + 1
-            while j < len(lines) and not lines[j].startswith(f'{kind.capitalize()} #'):
+            while j < len(lines) and not lines[j].strip().startswith(f'{kind.capitalize()} #'):
                 spec = lines[j].strip()
                 if spec.startswith('Sample Specification:'):
                     # Example: "Sample Specification: s16le 2ch 48000Hz"
@@ -217,8 +217,12 @@ def main():
     out_pactl, out_desc = pick(sinks,   "Output device (headphones)")
     in_pactl,  in_desc  = pick(sources, "Input device  (microphone)")
 
-    out_rate = pactl_device_sample_rate('sink', out_pactl)
-    in_rate = pactl_device_sample_rate('source', in_pactl)
+    try:
+        out_rate = pactl_device_sample_rate('sink', out_pactl)
+        in_rate = pactl_device_sample_rate('source', in_pactl)
+    except subprocess.CalledProcessError:
+        out_rate = None
+        in_rate = None
     if out_rate and in_rate and out_rate == in_rate:
         sample_rate = out_rate
         rate_note = "sink/source native rates match"
