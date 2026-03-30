@@ -17,6 +17,9 @@ RECORD_SECS    = 2.5
 CHIRP_OFFSET   = 0.4
 CHIRP_DURATION = 0.05
 NUM_TRIALS     = 5
+MIN_LAT_MS     = 10
+MAX_LAT_MS     = 800
+CONFIDENCE_MIN = 12
 
 
 def pactl_devices(kind):
@@ -37,6 +40,9 @@ def pactl_devices(kind):
 
 
 def pick(devices, label):
+    if not devices:
+        raise RuntimeError(f"No {label.lower()} detected by pactl.")
+
     print(f"\n{label}:")
     for i, (_, desc) in enumerate(devices):
         print(f"  [{i}] {desc}")
@@ -52,10 +58,21 @@ def pick(devices, label):
 
 
 def generate_chirp():
-    t = np.linspace(0, CHIRP_DURATION, int(SAMPLE_RATE * CHIRP_DURATION))
+    t = np.linspace(0, CHIRP_DURATION, int(SAMPLE_RATE * CHIRP_DURATION), endpoint=False)
     sig = chirp(t, f0=200, f1=8000, t1=CHIRP_DURATION, method='logarithmic')
     sig *= np.hanning(len(sig))
     return sig.astype(np.float32)
+
+
+def parabolic_peak_offset(y, idx):
+    """Return sub-sample peak offset in [-0.5, 0.5] around integer idx."""
+    if idx <= 0 or idx >= len(y) - 1:
+        return 0.0
+    y0, y1, y2 = float(y[idx - 1]), float(y[idx]), float(y[idx + 1])
+    denom = y0 - 2.0 * y1 + y2
+    if abs(denom) < 1e-12:
+        return 0.0
+    return 0.5 * (y0 - y2) / denom
 
 
 def measure(out_pactl, in_pactl):
@@ -71,7 +88,8 @@ def measure(out_pactl, in_pactl):
     total        = int(SAMPLE_RATE * RECORD_SECS)
 
     playback = np.zeros(total, dtype=np.float32)
-    playback[click_sample:click_sample + len(chirp_sig)] = chirp_sig
+    end = min(click_sample + len(chirp_sig), total)
+    playback[click_sample:end] = chirp_sig[:max(0, end - click_sample)]
 
     latencies = []
 
@@ -80,21 +98,23 @@ def measure(out_pactl, in_pactl):
             play_pos = [0]
             rec_pos  = [0]
             rec_buf  = np.zeros(total, dtype=np.float32)
+            saw_xrun = [False]
 
-            def out_cb(outdata, frames, time_info, status):
-                s, e = play_pos[0], min(play_pos[0] + frames, total)
-                n = e - s
-                outdata[:n, 0] = playback[s:e]
-                if n < frames:
-                    outdata[n:, 0] = 0.0
-                play_pos[0] = e
+            def duplex_cb(indata, outdata, frames, time_info, status):
+                if status:
+                    saw_xrun[0] = True
+                out_s, out_e = play_pos[0], min(play_pos[0] + frames, total)
+                out_n = out_e - out_s
+                outdata[:out_n, 0] = playback[out_s:out_e]
+                if out_n < frames:
+                    outdata[out_n:, 0] = 0.0
+                play_pos[0] = out_e
 
-            def in_cb(indata, frames, time_info, status):
-                s, e = rec_pos[0], min(rec_pos[0] + frames, total)
-                n = e - s
-                if n > 0:
-                    rec_buf[s:e] = indata[:n, 0]
-                    rec_pos[0]   = e
+                in_s, in_e = rec_pos[0], min(rec_pos[0] + frames, total)
+                in_n = in_e - in_s
+                if in_n > 0:
+                    rec_buf[in_s:in_e] = indata[:in_n, 0]
+                    rec_pos[0] = in_e
 
             if trial == 0:
                 print(f"  Warmup ...", end='', flush=True)
@@ -102,26 +122,53 @@ def measure(out_pactl, in_pactl):
                 print(f"  Trial {trial}/{NUM_TRIALS} ...", end='', flush=True)
 
             try:
-                with sd.OutputStream(samplerate=SAMPLE_RATE, channels=1,
-                                     callback=out_cb, latency='low'), \
-                     sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
-                                    callback=in_cb, latency='low'):
+                with sd.Stream(samplerate=SAMPLE_RATE,
+                               channels=1,
+                               dtype='float32',
+                               callback=duplex_cb,
+                               latency='low'):
                     time.sleep(RECORD_SECS + 0.3)
             except sd.PortAudioError as e:
                 print(f" ERROR: {e}")
                 continue
 
-            corr = correlate(rec_buf, chirp_sig, mode='full')
-            lag  = int(np.argmax(np.abs(corr))) - (len(chirp_sig) - 1)
-            latency_ms = ((lag - click_sample) / SAMPLE_RATE) * 1000
+            rec = rec_buf - np.mean(rec_buf)
+            rec_std = float(np.std(rec)) + 1e-9
+            rec = rec / rec_std
+            ref = chirp_sig - np.mean(chirp_sig)
+            ref = ref / (float(np.std(ref)) + 1e-9)
+
+            corr = correlate(rec, ref, mode='full')
+            corr_abs = np.abs(corr)
+
+            min_lag = click_sample + int((MIN_LAT_MS / 1000.0) * SAMPLE_RATE)
+            max_lag = min(total - 1, click_sample + int((MAX_LAT_MS / 1000.0) * SAMPLE_RATE))
+            min_idx = min_lag + (len(chirp_sig) - 1)
+            max_idx = max_lag + (len(chirp_sig) - 1)
+
+            if max_idx <= min_idx or min_idx < 0 or max_idx >= len(corr_abs):
+                print(" no signal (search window invalid)")
+                continue
+
+            local = corr_abs[min_idx:max_idx + 1]
+            peak_local = int(np.argmax(local))
+            peak_idx = min_idx + peak_local
+            frac = parabolic_peak_offset(corr_abs, peak_idx)
+            lag = (peak_idx - (len(chirp_sig) - 1)) + frac
+            latency_ms = ((lag - click_sample) / SAMPLE_RATE) * 1000.0
+            peak = float(np.max(corr_abs))
+            med = float(np.median(corr_abs)) + 1e-9
+            confidence = peak / med
 
             if trial == 0:
                 print(f" {latency_ms:.1f} ms (discarded)")
-            elif 10 < latency_ms < 800:
+            elif saw_xrun[0]:
+                print(" skipped (audio over/underrun)")
+            elif MIN_LAT_MS < latency_ms < MAX_LAT_MS and confidence > CONFIDENCE_MIN:
                 latencies.append(latency_ms)
-                print(f" {latency_ms:.1f} ms")
+                print(f" {latency_ms:.1f} ms (conf={confidence:.1f})")
             else:
-                print(f" no signal ({latency_ms:.1f} ms) — hold mic against ear cup")
+                print(f" no signal ({latency_ms:.1f} ms, conf={confidence:.1f}) — hold mic against ear cup")
 
             time.sleep(0.3)
     finally:
@@ -135,8 +182,15 @@ def main():
     print("=== bt-latency — Bluetooth Audio Latency Tester ===")
     print("Hold the mic firmly against one ear cup throughout.\n")
 
-    sinks   = pactl_devices('sink')
-    sources = pactl_devices('source')
+    try:
+        sinks   = pactl_devices('sink')
+        sources = pactl_devices('source')
+    except FileNotFoundError:
+        print("ERROR: 'pactl' not found. Install PulseAudio/PipeWire utilities.")
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: failed to query audio devices with pactl: {e}")
+        sys.exit(1)
 
     out_pactl, out_desc = pick(sinks,   "Output device (headphones)")
     in_pactl,  in_desc  = pick(sources, "Input device  (microphone)")
@@ -166,5 +220,8 @@ def main():
 if __name__ == '__main__':
     try:
         main()
+    except RuntimeError as e:
+        print(f"\n{e}")
+        sys.exit(1)
     except KeyboardInterrupt:
         print("\nAborted.")
