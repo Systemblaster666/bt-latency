@@ -37,6 +37,9 @@ def pactl_devices(kind):
 
 
 def pick(devices, label):
+    if not devices:
+        raise RuntimeError(f"No {label.lower()} detected by pactl.")
+
     print(f"\n{label}:")
     for i, (_, desc) in enumerate(devices):
         print(f"  [{i}] {desc}")
@@ -52,7 +55,7 @@ def pick(devices, label):
 
 
 def generate_chirp():
-    t = np.linspace(0, CHIRP_DURATION, int(SAMPLE_RATE * CHIRP_DURATION))
+    t = np.linspace(0, CHIRP_DURATION, int(SAMPLE_RATE * CHIRP_DURATION), endpoint=False)
     sig = chirp(t, f0=200, f1=8000, t1=CHIRP_DURATION, method='logarithmic')
     sig *= np.hanning(len(sig))
     return sig.astype(np.float32)
@@ -71,7 +74,8 @@ def measure(out_pactl, in_pactl):
     total        = int(SAMPLE_RATE * RECORD_SECS)
 
     playback = np.zeros(total, dtype=np.float32)
-    playback[click_sample:click_sample + len(chirp_sig)] = chirp_sig
+    end = min(click_sample + len(chirp_sig), total)
+    playback[click_sample:end] = chirp_sig[:max(0, end - click_sample)]
 
     latencies = []
 
@@ -80,8 +84,11 @@ def measure(out_pactl, in_pactl):
             play_pos = [0]
             rec_pos  = [0]
             rec_buf  = np.zeros(total, dtype=np.float32)
+            saw_xrun = [False]
 
             def out_cb(outdata, frames, time_info, status):
+                if status:
+                    saw_xrun[0] = True
                 s, e = play_pos[0], min(play_pos[0] + frames, total)
                 n = e - s
                 outdata[:n, 0] = playback[s:e]
@@ -90,6 +97,8 @@ def measure(out_pactl, in_pactl):
                 play_pos[0] = e
 
             def in_cb(indata, frames, time_info, status):
+                if status:
+                    saw_xrun[0] = True
                 s, e = rec_pos[0], min(rec_pos[0] + frames, total)
                 n = e - s
                 if n > 0:
@@ -112,12 +121,18 @@ def measure(out_pactl, in_pactl):
                 continue
 
             corr = correlate(rec_buf, chirp_sig, mode='full')
-            lag  = int(np.argmax(np.abs(corr))) - (len(chirp_sig) - 1)
+            corr_abs = np.abs(corr)
+            lag  = int(np.argmax(corr_abs)) - (len(chirp_sig) - 1)
             latency_ms = ((lag - click_sample) / SAMPLE_RATE) * 1000
+            peak = float(np.max(corr_abs))
+            med = float(np.median(corr_abs)) + 1e-9
+            confidence = peak / med
 
             if trial == 0:
                 print(f" {latency_ms:.1f} ms (discarded)")
-            elif 10 < latency_ms < 800:
+            elif saw_xrun[0]:
+                print(" skipped (audio over/underrun)")
+            elif 10 < latency_ms < 800 and confidence > 15:
                 latencies.append(latency_ms)
                 print(f" {latency_ms:.1f} ms")
             else:
@@ -135,8 +150,15 @@ def main():
     print("=== bt-latency — Bluetooth Audio Latency Tester ===")
     print("Hold the mic firmly against one ear cup throughout.\n")
 
-    sinks   = pactl_devices('sink')
-    sources = pactl_devices('source')
+    try:
+        sinks   = pactl_devices('sink')
+        sources = pactl_devices('source')
+    except FileNotFoundError:
+        print("ERROR: 'pactl' not found. Install PulseAudio/PipeWire utilities.")
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: failed to query audio devices with pactl: {e}")
+        sys.exit(1)
 
     out_pactl, out_desc = pick(sinks,   "Output device (headphones)")
     in_pactl,  in_desc  = pick(sources, "Input device  (microphone)")
@@ -166,5 +188,8 @@ def main():
 if __name__ == '__main__':
     try:
         main()
+    except RuntimeError as e:
+        print(f"\n{e}")
+        sys.exit(1)
     except KeyboardInterrupt:
         print("\nAborted.")
