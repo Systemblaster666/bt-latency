@@ -239,7 +239,11 @@ def main():
         loopback = load_f32(lb_file)
         mic      = load_f32(mic_file)
         min_len  = min(loopback.size, mic.size)
-        latency, confidence = measure_latency(loopback[:min_len], mic[:min_len])
+
+        # Skip the first 2s — this contains the beep which would dominate the
+        # cross-correlation and give a false 0ms result.
+        skip = int(SAMPLE_RATE * 2.0)
+        latency, confidence = measure_latency(loopback[skip:min_len], mic[skip:min_len])
 
     print(f"\n{'─' * 44}")
     print(f"  Device     : {out_desc}")
