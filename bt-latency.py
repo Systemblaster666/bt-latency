@@ -79,8 +79,8 @@ def pick(devices, label):
             sys.exit(0)
 
 
-def generate_chirp(sample_rate):
-    t = np.linspace(0, CHIRP_DURATION, int(sample_rate * CHIRP_DURATION), endpoint=False)
+def generate_chirp():
+    t = np.linspace(0, CHIRP_DURATION, int(SAMPLE_RATE * CHIRP_DURATION), endpoint=False)
     sig = chirp(t, f0=200, f1=8000, t1=CHIRP_DURATION, method='logarithmic')
     sig *= np.hanning(len(sig))
     return sig.astype(np.float32)
@@ -122,21 +122,24 @@ def measure(out_pactl, in_pactl, sample_rate):
             rec_buf  = np.zeros(total, dtype=np.float32)
             saw_xrun = [False]
 
-            def duplex_cb(indata, outdata, frames, time_info, status):
+            def out_cb(outdata, frames, time_info, status):
                 if status:
                     saw_xrun[0] = True
-                out_s, out_e = play_pos[0], min(play_pos[0] + frames, total)
-                out_n = out_e - out_s
-                outdata[:out_n, 0] = playback[out_s:out_e]
-                if out_n < frames:
-                    outdata[out_n:, 0] = 0.0
-                play_pos[0] = out_e
+                s, e = play_pos[0], min(play_pos[0] + frames, total)
+                n = e - s
+                outdata[:n, 0] = playback[s:e]
+                if n < frames:
+                    outdata[n:, 0] = 0.0
+                play_pos[0] = e
 
-                in_s, in_e = rec_pos[0], min(rec_pos[0] + frames, total)
-                in_n = in_e - in_s
-                if in_n > 0:
-                    rec_buf[in_s:in_e] = indata[:in_n, 0]
-                    rec_pos[0] = in_e
+            def in_cb(indata, frames, time_info, status):
+                if status:
+                    saw_xrun[0] = True
+                s, e = rec_pos[0], min(rec_pos[0] + frames, total)
+                n = e - s
+                if n > 0:
+                    rec_buf[s:e] = indata[:n, 0]
+                    rec_pos[0]   = e
 
             if trial == 0:
                 print(f"  Warmup ...", end='', flush=True)
@@ -154,30 +157,10 @@ def measure(out_pactl, in_pactl, sample_rate):
                 print(f" ERROR: {e}")
                 continue
 
-            rec = rec_buf - np.mean(rec_buf)
-            rec_std = float(np.std(rec)) + 1e-9
-            rec = rec / rec_std
-            ref = chirp_sig - np.mean(chirp_sig)
-            ref = ref / (float(np.std(ref)) + 1e-9)
-
-            corr = correlate(rec, ref, mode='full')
+            corr = correlate(rec_buf, chirp_sig, mode='full')
             corr_abs = np.abs(corr)
-
-            min_lag = click_sample + int((MIN_LAT_MS / 1000.0) * sample_rate)
-            max_lag = min(total - 1, click_sample + int((MAX_LAT_MS / 1000.0) * sample_rate))
-            min_idx = min_lag + (len(chirp_sig) - 1)
-            max_idx = max_lag + (len(chirp_sig) - 1)
-
-            if max_idx <= min_idx or min_idx < 0 or max_idx >= len(corr_abs):
-                print(" no signal (search window invalid)")
-                continue
-
-            local = corr_abs[min_idx:max_idx + 1]
-            peak_local = int(np.argmax(local))
-            peak_idx = min_idx + peak_local
-            frac = parabolic_peak_offset(corr_abs, peak_idx)
-            lag = (peak_idx - (len(chirp_sig) - 1)) + frac
-            latency_ms = ((lag - click_sample) / sample_rate) * 1000.0
+            lag  = int(np.argmax(corr_abs)) - (len(chirp_sig) - 1)
+            latency_ms = ((lag - click_sample) / SAMPLE_RATE) * 1000
             peak = float(np.max(corr_abs))
             med = float(np.median(corr_abs)) + 1e-9
             confidence = peak / med
@@ -186,7 +169,7 @@ def measure(out_pactl, in_pactl, sample_rate):
                 print(f" {latency_ms:.1f} ms (discarded)")
             elif saw_xrun[0]:
                 print(" skipped (audio over/underrun)")
-            elif MIN_LAT_MS < latency_ms < MAX_LAT_MS and confidence > CONFIDENCE_MIN:
+            elif 10 < latency_ms < 800 and confidence > 15:
                 latencies.append(latency_ms)
                 print(f" {latency_ms:.1f} ms (conf={confidence:.1f})")
             else:
