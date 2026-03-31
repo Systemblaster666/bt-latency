@@ -2,18 +2,15 @@
 """
 game-latency.py — Measure real in-game audio latency.
 
-Records simultaneously:
-  - PipeWire monitor source  (digital loopback — what the game outputs, zero-latency reference)
-  - Microphone               (physical pickup — when sound exits your headphones)
-
-Cross-correlates the two to find end-to-end latency for any game audio.
+Records loopback (digital reference) + microphone (acoustic output) simultaneously.
+Runs 5 trials — each trial beeps, you fire one shot, it measures the delay.
+Results are averaged for accuracy.
 
 Usage:
     python3 game-latency.py
 
-During the recording window, make a loud distinct in-game sound
-(e.g. Cassidy primary fire in Overwatch).
 Hold the mic against the headphone ear cup throughout.
+Fire ONE shot per beep.
 """
 
 import os
@@ -26,10 +23,13 @@ import numpy as np
 import sounddevice as sd
 from scipy.signal import correlate
 
-SAMPLE_RATE  = 48000
-RECORD_SECS  = 8
-CHANNELS     = 1
-COUNTDOWN    = 3
+SAMPLE_RATE   = 48000
+NUM_TRIALS    = 5
+TRIAL_SECS    = 3.0    # recording window per trial
+BEEP_OFFSET   = 0.4    # seconds after recording start when beep fires
+ANALYSIS_SKIP = 0.6    # skip first N seconds before cross-correlating (past the beep)
+INTER_TRIAL   = 1.5    # pause between trials
+CONFIDENCE_MIN = 10
 
 
 # ── Device listing ────────────────────────────────────────────────────────────
@@ -55,13 +55,10 @@ def sources_no_monitor():
     return [(n, d) for n, d in pactl_devices('source') if '.monitor' not in n]
 
 def find_monitor(sink_name):
-    """PipeWire always creates <sink_name>.monitor as a source."""
     monitor_name = sink_name + '.monitor'
-    # Verify it exists in pactl sources
     for name, desc in pactl_devices('source'):
         if name == monitor_name:
             return name, desc
-    # Return it anyway — pw-record will error if it doesn't exist
     return monitor_name, f'Monitor of {sink_name}'
 
 
@@ -82,57 +79,33 @@ def pick(devices, label):
             sys.exit(0)
 
 
-# ── Audible beep ──────────────────────────────────────────────────────────────
+# ── Audio cue ─────────────────────────────────────────────────────────────────
 
-def beep(freq=880, duration=0.15):
-    """Play a short tone through the default output so the user knows when to shoot."""
+def beep(freq=880, duration=0.12):
     t   = np.linspace(0, duration, int(SAMPLE_RATE * duration), endpoint=False)
     sig = np.sin(2 * np.pi * freq * t).astype(np.float32)
     sig *= np.hanning(len(sig))
     try:
         sd.play(sig, samplerate=SAMPLE_RATE, blocking=True)
     except Exception:
-        pass  # non-fatal if output fails
+        pass
 
 
 # ── Recording ─────────────────────────────────────────────────────────────────
 
-def record(source_name, filepath, duration, errors):
-    """Record from a PipeWire source into a raw float32 file."""
-    result = subprocess.run(
-        ['pw-record', '--target', source_name,
-         '--rate', str(SAMPLE_RATE),
-         '--channels', str(CHANNELS),
-         '--format', 'f32',
-         filepath],
-        timeout=duration + 3,
-        capture_output=True,
-        text=True
-    )
-    if result.returncode not in (0, -15):  # -15 = SIGTERM (normal termination)
-        errors.append(f"{source_name}: {result.stderr.strip()}")
-
-
-def record_timed(source_name, filepath, duration, errors):
-    """Wrapper that terminates pw-record after duration seconds."""
+def record_timed(source_name, filepath, duration):
     proc = subprocess.Popen(
         ['pw-record', '--target', source_name,
          '--rate', str(SAMPLE_RATE),
-         '--channels', str(CHANNELS),
+         '--channels', '1',
          '--format', 'f32',
          filepath],
-        stderr=subprocess.PIPE,
-        text=True
+        stderr=subprocess.DEVNULL
     )
     time.sleep(duration)
     proc.terminate()
     try:
-        _, stderr = proc.communicate(timeout=2)
-        # pw-record prints the output filepath to stderr as a normal status line — ignore it
-        real_errors = [l for l in (stderr or '').splitlines()
-                       if l.strip() and filepath not in l and 'Recording' not in l]
-        if real_errors:
-            errors.append(f"{source_name}: {'; '.join(real_errors)}")
+        proc.wait(timeout=2)
     except subprocess.TimeoutExpired:
         proc.kill()
 
@@ -163,7 +136,7 @@ def measure_latency(loopback, mic):
 
 def describe(ms):
     if ms < 0:
-        return "Negative result — check device selection"
+        return "Negative — check device selection"
     elif ms < 20:
         return "Wired-equivalent — imperceptible"
     elif ms < 50:
@@ -173,85 +146,97 @@ def describe(ms):
     elif ms < 250:
         return "Moderate — noticeable in rhythm games"
     else:
-        return "High — significant BT or software buffering overhead"
+        return "High — significant BT or software buffering"
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def run_trial(mon_name, in_name, tmp):
+    lb_file  = os.path.join(tmp, 'lb.f32')
+    mic_file = os.path.join(tmp, 'mic.f32')
+
+    # Start recording first
+    t_lb  = threading.Thread(target=record_timed, args=(mon_name, lb_file,  TRIAL_SECS))
+    t_mic = threading.Thread(target=record_timed, args=(in_name,  mic_file, TRIAL_SECS))
+    t_lb.start()
+    t_mic.start()
+
+    # Let pw-record spin up, then beep
+    time.sleep(BEEP_OFFSET)
+    beep(freq=880,  duration=0.10)
+    time.sleep(0.08)
+    beep(freq=1200, duration=0.10)
+
+    t_lb.join()
+    t_mic.join()
+
+    loopback = load_f32(lb_file)
+    mic      = load_f32(mic_file)
+
+    if loopback.size == 0 or mic.size == 0:
+        return None, 0.0, "empty recording"
+
+    min_len  = min(loopback.size, mic.size)
+    skip     = int(SAMPLE_RATE * ANALYSIS_SKIP)
+
+    if min_len - skip < SAMPLE_RATE:
+        return None, 0.0, "recording too short"
+
+    latency, confidence = measure_latency(loopback[skip:min_len], mic[skip:min_len])
+    return latency, confidence, None
+
+
 def main():
     print("=== game-latency — In-Game Audio Latency Tester ===")
+    print("Each beep = fire ONE shot in-game.")
     print("Hold the mic firmly against the headphone ear cup throughout.\n")
 
-    out_name,  out_desc  = pick(sinks(),              "Game output device")
-    in_name,   in_desc   = pick(sources_no_monitor(), "Microphone")
-    mon_name,  mon_desc  = find_monitor(out_name)
+    out_name, out_desc = pick(sinks(),              "Game output device")
+    in_name,  in_desc  = pick(sources_no_monitor(), "Microphone")
+    mon_name, mon_desc = find_monitor(out_name)
 
     print(f"\nOutput  : {out_desc}")
     print(f"Monitor : {mon_desc}")
     print(f"Mic     : {in_desc}")
-    print(f"\nRecording will start, then a BEEP signals when to shoot.")
-    print(f"You have {RECORD_SECS}s after the beep.\n")
+    print(f"\nRunning {NUM_TRIALS} trials. Fire one shot per beep.\n")
+    time.sleep(1)
+
+    latencies = []
 
     with tempfile.TemporaryDirectory() as tmp:
-        lb_file  = os.path.join(tmp, 'loopback.f32')
-        mic_file = os.path.join(tmp, 'mic.f32')
-        errors   = []
+        for trial in range(NUM_TRIALS):
+            print(f"  Trial {trial + 1}/{NUM_TRIALS} ...", end='', flush=True)
 
-        # Start recording FIRST, then beep so no sounds are missed
-        t_lb  = threading.Thread(target=record_timed, args=(mon_name, lb_file,  RECORD_SECS + 1, errors))
-        t_mic = threading.Thread(target=record_timed, args=(in_name,  mic_file, RECORD_SECS + 1, errors))
-        t_lb.start()
-        t_mic.start()
+            latency, confidence, err = run_trial(mon_name, in_name, tmp)
 
-        # Brief pause to let pw-record spin up, then beep
-        time.sleep(0.5)
-        print("  *** BEEP = shoot now ***")
-        beep(freq=880, duration=0.15)
-        time.sleep(0.1)
-        beep(freq=1200, duration=0.15)  # double beep so it's obvious
+            if err:
+                print(f" failed ({err})")
+            elif confidence < CONFIDENCE_MIN:
+                print(f" no clear signal (conf={confidence:.1f}x) — did you fire?")
+            elif not (0 < latency < 800):
+                print(f" invalid ({latency:.1f} ms, conf={confidence:.1f}x)")
+            else:
+                latencies.append(latency)
+                print(f" {latency:.1f} ms  (conf={confidence:.1f}x)")
 
-        for remaining in range(RECORD_SECS, 0, -1):
-            print(f"\r  {remaining}s remaining...", end='', flush=True)
-            time.sleep(1)
-        print("\r  Recording done.        ")
+            if trial < NUM_TRIALS - 1:
+                time.sleep(INTER_TRIAL)
 
-        t_lb.join()
-        t_mic.join()
-
-        # Show debug info
-        lb_size  = os.path.getsize(lb_file)  if os.path.exists(lb_file)  else 0
-        mic_size = os.path.getsize(mic_file) if os.path.exists(mic_file) else 0
-        print(f"\n  Loopback : {lb_size // 1024} KB recorded")
-        print(f"  Mic      : {mic_size // 1024} KB recorded")
-
-        if errors:
-            print("\nRecording errors:")
-            for e in errors:
-                print(f"  {e}")
-
-        if lb_size == 0 or mic_size == 0:
-            print("\nERROR: One or both recordings are empty.")
-            print("  - Check that pw-record is installed: which pw-record")
-            print(f"  - Monitor source may not exist: {mon_name}")
-            print("    Run: pactl list sources | grep monitor")
-            sys.exit(1)
-
-        loopback = load_f32(lb_file)
-        mic      = load_f32(mic_file)
-        min_len  = min(loopback.size, mic.size)
-
-        # Skip the first 2s — this contains the beep which would dominate the
-        # cross-correlation and give a false 0ms result.
-        skip = int(SAMPLE_RATE * 2.0)
-        latency, confidence = measure_latency(loopback[skip:min_len], mic[skip:min_len])
-
-    print(f"\n{'─' * 44}")
-    print(f"  Device     : {out_desc}")
-    print(f"  Latency    : {latency:.1f} ms")
-    print(f"  Confidence : {confidence:.1f}x  {'✓' if confidence > 12 else '⚠ weak — louder sound or closer mic'}")
-    print(f"  {describe(latency)}")
-    print(f"{'─' * 44}")
-    print("\nTip: run several times and average — a single shot can vary slightly.")
+    if latencies:
+        print(f"\n{'─' * 44}")
+        print(f"  Device : {out_desc}")
+        print(f"  Trials : {len(latencies)}/{NUM_TRIALS} valid")
+        print(f"  Min    : {min(latencies):.1f} ms")
+        print(f"  Max    : {max(latencies):.1f} ms")
+        print(f"  Mean   : {np.mean(latencies):.1f} ms")
+        print(f"  Median : {np.median(latencies):.1f} ms")
+        print(f"  {describe(np.median(latencies))}")
+        print(f"{'─' * 44}")
+    else:
+        print("\nNo valid results. Check:")
+        print("  - Mic is held against the headphone cup")
+        print("  - Game audio is playing through the selected output")
+        print("  - You fired a shot after each beep")
 
 
 if __name__ == '__main__':
