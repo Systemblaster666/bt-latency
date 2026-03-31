@@ -128,8 +128,11 @@ def record_timed(source_name, filepath, duration, errors):
     proc.terminate()
     try:
         _, stderr = proc.communicate(timeout=2)
-        if proc.returncode not in (0, -15) and stderr.strip():
-            errors.append(f"{source_name}: {stderr.strip()}")
+        # pw-record prints the output filepath to stderr as a normal status line — ignore it
+        real_errors = [l for l in (stderr or '').splitlines()
+                       if l.strip() and filepath not in l and 'Recording' not in l]
+        if real_errors:
+            errors.append(f"{source_name}: {'; '.join(real_errors)}")
     except subprocess.TimeoutExpired:
         proc.kill()
 
