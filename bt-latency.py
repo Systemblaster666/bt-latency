@@ -122,17 +122,19 @@ def measure(out_pactl, in_pactl, sample_rate):
             rec_buf  = np.zeros(total, dtype=np.float32)
             saw_xrun = [False]
 
-            def duplex_cb(indata, outdata, frames, time_info, status):
+            def out_cb(outdata, frames, time_info, status):
                 if status:
                     saw_xrun[0] = True
-                # Playback
                 s, e = play_pos[0], min(play_pos[0] + frames, total)
                 n = e - s
                 outdata[:n, 0] = playback[s:e]
                 if n < frames:
                     outdata[n:, 0] = 0.0
                 play_pos[0] = e
-                # Recording
+
+            def in_cb(indata, frames, time_info, status):
+                if status:
+                    saw_xrun[0] = True
                 s, e = rec_pos[0], min(rec_pos[0] + frames, total)
                 n = e - s
                 if n > 0:
@@ -145,11 +147,10 @@ def measure(out_pactl, in_pactl, sample_rate):
                 print(f"  Trial {trial}/{NUM_TRIALS} ...", end='', flush=True)
 
             try:
-                with sd.Stream(samplerate=sample_rate,
-                               channels=1,
-                               dtype='float32',
-                               callback=duplex_cb,
-                               latency='low'):
+                with sd.OutputStream(samplerate=sample_rate, channels=1,
+                                     dtype='float32', callback=out_cb, latency='low'), \
+                     sd.InputStream(samplerate=sample_rate, channels=1,
+                                    dtype='float32', callback=in_cb, latency='low'):
                     time.sleep(RECORD_SECS + 0.3)
             except sd.PortAudioError as e:
                 print(f" ERROR: {e}")
