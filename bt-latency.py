@@ -12,11 +12,14 @@ import numpy as np
 import sounddevice as sd
 from scipy.signal import chirp, correlate
 
-SAMPLE_RATE    = 48000
+FALLBACK_SAMPLE_RATE = 48000
 RECORD_SECS    = 2.5
 CHIRP_OFFSET   = 0.4
 CHIRP_DURATION = 0.05
 NUM_TRIALS     = 5
+MIN_LAT_MS     = 10
+MAX_LAT_MS     = 800
+CONFIDENCE_MIN = 12
 
 
 def pactl_devices(kind):
@@ -34,6 +37,28 @@ def pactl_devices(kind):
                 devices.append((name, desc))
             name = desc = None
     return devices
+
+
+def pactl_device_sample_rate(kind, pactl_name):
+    """Return native sample rate in Hz for a specific sink/source, if reported."""
+    out = subprocess.check_output(['pactl', 'list', f'{kind}s'], text=True)
+    lines = out.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if line.startswith('Name:') and line.split(':', 1)[1].strip() == pactl_name:
+            j = i + 1
+            while j < len(lines) and not lines[j].strip().startswith(f'{kind.capitalize()} #'):
+                spec = lines[j].strip()
+                if spec.startswith('Sample Specification:'):
+                    # Example: "Sample Specification: s16le 2ch 48000Hz"
+                    for token in spec.split():
+                        if token.endswith('Hz') and token[:-2].isdigit():
+                            return int(token[:-2])
+                j += 1
+            return None
+        i += 1
+    return None
 
 
 def pick(devices, label):
@@ -61,7 +86,18 @@ def generate_chirp():
     return sig.astype(np.float32)
 
 
-def measure(out_pactl, in_pactl):
+def parabolic_peak_offset(y, idx):
+    """Return sub-sample peak offset in [-0.5, 0.5] around integer idx."""
+    if idx <= 0 or idx >= len(y) - 1:
+        return 0.0
+    y0, y1, y2 = float(y[idx - 1]), float(y[idx]), float(y[idx + 1])
+    denom = y0 - 2.0 * y1 + y2
+    if abs(denom) < 1e-12:
+        return 0.0
+    return 0.5 * (y0 - y2) / denom
+
+
+def measure(out_pactl, in_pactl, sample_rate):
     # Temporarily set PipeWire defaults so sounddevice picks them up
     orig_sink   = subprocess.check_output(['pactl', 'get-default-sink'],   text=True).strip()
     orig_source = subprocess.check_output(['pactl', 'get-default-source'], text=True).strip()
@@ -69,9 +105,9 @@ def measure(out_pactl, in_pactl):
     subprocess.run(['pactl', 'set-default-source', in_pactl],  check=True)
     time.sleep(0.3)  # let PipeWire settle
 
-    chirp_sig    = generate_chirp()
-    click_sample = int(SAMPLE_RATE * CHIRP_OFFSET)
-    total        = int(SAMPLE_RATE * RECORD_SECS)
+    chirp_sig    = generate_chirp(sample_rate)
+    click_sample = int(sample_rate * CHIRP_OFFSET)
+    total        = int(sample_rate * RECORD_SECS)
 
     playback = np.zeros(total, dtype=np.float32)
     end = min(click_sample + len(chirp_sig), total)
@@ -111,10 +147,11 @@ def measure(out_pactl, in_pactl):
                 print(f"  Trial {trial}/{NUM_TRIALS} ...", end='', flush=True)
 
             try:
-                with sd.OutputStream(samplerate=SAMPLE_RATE, channels=1,
-                                     callback=out_cb, latency='low'), \
-                     sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
-                                    callback=in_cb, latency='low'):
+                with sd.Stream(samplerate=sample_rate,
+                               channels=1,
+                               dtype='float32',
+                               callback=duplex_cb,
+                               latency='low'):
                     time.sleep(RECORD_SECS + 0.3)
             except sd.PortAudioError as e:
                 print(f" ERROR: {e}")
@@ -134,9 +171,9 @@ def measure(out_pactl, in_pactl):
                 print(" skipped (audio over/underrun)")
             elif 10 < latency_ms < 800 and confidence > 15:
                 latencies.append(latency_ms)
-                print(f" {latency_ms:.1f} ms")
+                print(f" {latency_ms:.1f} ms (conf={confidence:.1f})")
             else:
-                print(f" no signal ({latency_ms:.1f} ms) — hold mic against ear cup")
+                print(f" no signal ({latency_ms:.1f} ms, conf={confidence:.1f}) — hold mic against ear cup")
 
             time.sleep(0.3)
     finally:
@@ -163,11 +200,31 @@ def main():
     out_pactl, out_desc = pick(sinks,   "Output device (headphones)")
     in_pactl,  in_desc  = pick(sources, "Input device  (microphone)")
 
+    try:
+        out_rate = pactl_device_sample_rate('sink', out_pactl)
+        in_rate = pactl_device_sample_rate('source', in_pactl)
+    except subprocess.CalledProcessError:
+        out_rate = None
+        in_rate = None
+    if out_rate and in_rate and out_rate == in_rate:
+        sample_rate = out_rate
+        rate_note = "sink/source native rates match"
+    elif out_rate and in_rate and out_rate != in_rate:
+        sample_rate = out_rate
+        rate_note = "native rates differ; resampling likely on one side"
+    elif out_rate or in_rate:
+        sample_rate = out_rate or in_rate
+        rate_note = "only one side reported native rate"
+    else:
+        sample_rate = FALLBACK_SAMPLE_RATE
+        rate_note = "native rate not reported by pactl"
+
     print(f"\nOutput : {out_desc}")
     print(f"Input  : {in_desc}")
+    print(f"Rate   : {sample_rate} Hz ({rate_note})")
     print(f"\nRunning {NUM_TRIALS} trials...\n")
 
-    latencies = measure(out_pactl, in_pactl)
+    latencies = measure(out_pactl, in_pactl, sample_rate)
 
     if latencies:
         print(f"\n{'─' * 44}")
