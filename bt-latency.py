@@ -79,8 +79,8 @@ def pick(devices, label):
             sys.exit(0)
 
 
-def generate_chirp():
-    t = np.linspace(0, CHIRP_DURATION, int(SAMPLE_RATE * CHIRP_DURATION), endpoint=False)
+def generate_chirp(sample_rate):
+    t = np.linspace(0, CHIRP_DURATION, int(sample_rate * CHIRP_DURATION), endpoint=False)
     sig = chirp(t, f0=200, f1=8000, t1=CHIRP_DURATION, method='logarithmic')
     sig *= np.hanning(len(sig))
     return sig.astype(np.float32)
@@ -122,19 +122,17 @@ def measure(out_pactl, in_pactl, sample_rate):
             rec_buf  = np.zeros(total, dtype=np.float32)
             saw_xrun = [False]
 
-            def out_cb(outdata, frames, time_info, status):
+            def duplex_cb(indata, outdata, frames, time_info, status):
                 if status:
                     saw_xrun[0] = True
+                # Playback
                 s, e = play_pos[0], min(play_pos[0] + frames, total)
                 n = e - s
                 outdata[:n, 0] = playback[s:e]
                 if n < frames:
                     outdata[n:, 0] = 0.0
                 play_pos[0] = e
-
-            def in_cb(indata, frames, time_info, status):
-                if status:
-                    saw_xrun[0] = True
+                # Recording
                 s, e = rec_pos[0], min(rec_pos[0] + frames, total)
                 n = e - s
                 if n > 0:
@@ -159,8 +157,9 @@ def measure(out_pactl, in_pactl, sample_rate):
 
             corr = correlate(rec_buf, chirp_sig, mode='full')
             corr_abs = np.abs(corr)
-            lag  = int(np.argmax(corr_abs)) - (len(chirp_sig) - 1)
-            latency_ms = ((lag - click_sample) / SAMPLE_RATE) * 1000
+            peak_idx = int(np.argmax(corr_abs))
+            lag = peak_idx - (len(chirp_sig) - 1) + parabolic_peak_offset(corr_abs, peak_idx)
+            latency_ms = ((lag - click_sample) / sample_rate) * 1000
             peak = float(np.max(corr_abs))
             med = float(np.median(corr_abs)) + 1e-9
             confidence = peak / med
@@ -169,7 +168,7 @@ def measure(out_pactl, in_pactl, sample_rate):
                 print(f" {latency_ms:.1f} ms (discarded)")
             elif saw_xrun[0]:
                 print(" skipped (audio over/underrun)")
-            elif 10 < latency_ms < 800 and confidence > 15:
+            elif MIN_LAT_MS < latency_ms < MAX_LAT_MS and confidence > CONFIDENCE_MIN:
                 latencies.append(latency_ms)
                 print(f" {latency_ms:.1f} ms (conf={confidence:.1f})")
             else:
